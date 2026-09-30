@@ -1,136 +1,274 @@
 <?php
-/*
 
-Namesilo Registrar Module 
+declare(strict_types=1);
 
-*/
+/**
+ * NameSilo registrar adapter for FOSSBilling.
+ *
+ * Documentation: https://github.com/insxa/Namesilo-Fossbilling
+ *
+ * NameSilo API:
+ * https://www.namesilo.com/api-reference
+ *
+ * All NameSilo API calls are GET requests.
+ */
 
 class Registrar_Adapter_Namesilo extends Registrar_AdapterAbstract
 {
-    public $config = array(
-        'apikey' => null,
-		'Payment_ID' => null
-    );
+    public $config = [
+        'api-key' => null,
+        'payment-id' => null,
+        'default-private' => true,
+        'default-auto-renew' => true,
+    ];
+
+    /**
+     * Constructor.
+     */
     public function __construct($options)
     {
-        if (!extension_loaded('curl')) {
-            throw new Registrar_Exception('CURL extension is not enabled');
-        }
-        if(isset($options['apikey']) && !empty($options['apikey'])) {
-            $this->config['apikey'] = $options['apikey'];
-            unset($options['apikey']);
+        if (isset($options['api-key']) && trim((string) $options['api-key']) !== '') {
+            $this->config['api-key'] = trim((string) $options['api-key']);
         } else {
-            throw new Registrar_Exception('Domain registrar "Namesilo" is not configured properly. Please update configuration parameter "Namesilo Apikey" at "Configuration -> Domain registration".');
+            throw new Registrar_Exception(
+                'The ":domain_registrar" domain registrar is not fully configured. Please configure the :missing',
+                [
+                    ':domain_registrar' => 'NameSilo',
+                    ':missing' => 'NameSilo API Key',
+                ],
+                3001
+            );
         }
-		
-        if(isset($options['Payment_ID']) && !empty($options['Payment_ID'])) {
-            $this->config['Payment_ID'] = $options['Payment_ID'];
-            unset($options['Payment_ID']);
-        }
-    }
-    public static function getConfig()
-    {
-        return array(
-            'label' => 'Manages domains on Namesilo via API',
-            'form'  => array(
-                'apikey' => array('password', array(
-                    'label' => 'Namesilo API key',
-                    'description'=>'Namesilo API key',
-                    'renderPassword' => true,
-                ),
-            ),
-                'Payment_ID' => array('Payment_ID', array(
-                    'label' => 'Payment ID',
-                    'description'=>'Payment ID',
-                    'required'=> false,
-                ),
-            ),
-            ),
-        );
-    }
 
-    public function getTlds()
-    {
-        return array(
-            '.com', '.net', '.org', '.biz', '.info', '.mobi', '.us', '.me', '.co'
+        $this->config['payment-id'] = isset($options['payment-id'])
+            ? trim((string) $options['payment-id'])
+            : '';
+
+        $this->config['default-private'] = $this->toBool(
+            $options['default-private'] ?? '1'
+        );
+
+        $this->config['default-auto-renew'] = $this->toBool(
+            $options['default-auto-renew'] ?? '1'
         );
     }
 
     /**
-     * @param Registrar_Domain $domain
-     * @return bool
-     * @throws Registrar_Exception
-     * @see https://www.namesilo.com/api_reference.php#checkRegisterAvailability
+     * FOSSBilling registrar configuration.
+     *
+     * multiOptions is used for the Yes/No radio fields.
      */
-    public function isDomainAvailable(Registrar_Domain $domain)
+    public static function getConfig(): array
     {
-        $params = array(
-            'domains' => $domain->getName(),
-        );
+        return [
+            'label' => 'Manages domains on NameSilo via API.',
+            'form' => [
+                'api-key' => [
+                    'password',
+                    [
+                        'label' => 'NameSilo API Key',
+                        'description' => 'Your NameSilo API key.',
+                        'required' => true,
+                        'renderPassword' => true,
+                    ],
+                ],
 
-        $result = $this->_request('checkRegisterAvailability', $params);
+                'payment-id' => [
+                    'text',
+                    [
+                        'label' => 'NameSilo Payment ID',
+                        'description' => 'Optional verified NameSilo payment ID. Leave empty to use account funds.',
+                        'required' => false,
+                    ],
+                ],
 
-        return (isset($result->reply->available)
-            && ($result->reply->available->domain == $domain->getName()));
+                'default-private' => [
+                    'radio',
+                    [
+                        'label' => 'Enable WHOIS privacy by default',
+                        'description' => 'Enable NameSilo WHOIS privacy when registering new domains.',
+                        'multiOptions' => [
+                            '1' => 'Yes',
+                            '0' => 'No',
+                        ],
+                    ],
+                ],
+
+                'default-auto-renew' => [
+                    'radio',
+                    [
+                        'label' => 'Enable automatic renewal by default',
+                        'description' => 'Enable NameSilo automatic renewal when registering new domains.',
+                        'multiOptions' => [
+                            '1' => 'Yes',
+                            '0' => 'No',
+                        ],
+                    ],
+                ],
+            ],
+        ];
     }
 
     /**
-     * @param Registrar_Domain $domain
-     * @return bool
-     * @throws Registrar_Exception
-     * @see https://www.namesilo.com/api_reference.php#changeNameServers
+     * Check domain registration availability.
      */
-    public function modifyNs(Registrar_Domain $domain)
+    public function isDomainAvailable(Registrar_Domain $domain): bool
     {
-        $params = array(
-            'domain' => $domain->getName()
+        $domainName = trim((string) $domain->getName());
+
+        if ($domainName === '') {
+            throw new Registrar_Exception(
+                'Domain name cannot be empty.'
+            );
+        }
+
+        $xml = $this->_request(
+            'checkRegisterAvailability',
+            [
+                'domains' => $domainName,
+            ]
         );
 
-        $params['ns1'] = $domain->getNs1();
-        $params['ns2'] = $domain->getNs2();
-        if($domain->getNs3())  {
-            $params['ns3'] = $domain->getNs3();
-        }
-        if($domain->getNs4())  {
-            $params['ns4'] = $domain->getNs4();
+        /*
+         * NameSilo returns:
+         *
+         * <available>
+         *     <domain price="...">example.com</domain>
+         * </available>
+         *
+         * It may also return multiple <domain> nodes.
+         */
+        if (!isset($xml->reply->available->domain)) {
+            return false;
         }
 
-        $this->_request('changeNameServers', $params, $args);
+        foreach ($xml->reply->available->domain as $availableDomain) {
+            if (
+                strcasecmp(
+                    trim((string) $availableDomain),
+                    $domainName
+                ) === 0
+            ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Check whether a domain can be transferred to NameSilo.
+     */
+    public function isDomaincanBeTransferred(Registrar_Domain $domain): bool
+    {
+        $domainName = trim((string) $domain->getName());
+
+        if ($domainName === '') {
+            throw new Registrar_Exception(
+                'Domain name cannot be empty.'
+            );
+        }
+
+        $xml = $this->_request(
+            'checkTransferAvailability',
+            [
+                'domains' => $domainName,
+            ]
+        );
+
+        if (!isset($xml->reply->available->domain)) {
+            return false;
+        }
+
+        foreach ($xml->reply->available->domain as $availableDomain) {
+            if (
+                strcasecmp(
+                    trim((string) $availableDomain),
+                    $domainName
+                ) === 0
+            ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Change domain nameservers.
+     */
+    public function modifyNs(Registrar_Domain $domain): bool
+    {
+        $params = [
+            'domain' => $domain->getName(),
+        ];
+
+        $this->addNameservers($params, $domain);
+
+        if (!isset($params['ns1'], $params['ns2'])) {
+            throw new Registrar_Exception(
+                'At least two nameservers are required.'
+            );
+        }
+
+        $this->_request('changeNameServers', $params);
 
         return true;
     }
 
     /**
-     * @param Registrar_Domain $domain
-     * @return bool
-     * @throws Registrar_Exception
-     * @see https://www.namesilo.com/api_reference.php#getDomainInfo
-     * @see https://www.namesilo.com/api_reference.php#contactUpdate
+     * Modify registrant contact information.
      */
-    public function modifyContact(Registrar_Domain $domain)
+    public function modifyContact(Registrar_Domain $domain): bool
     {
-        $c = $domain->getContactRegistrar();
-
-        $params = array(
-            'domain' => $domain->getName(),
+        $domainInfo = $this->_request(
+            'getDomainInfo',
+            [
+                'domain' => $domain->getName(),
+            ]
         );
 
-        $result = $this->_request('getDomainInfo', $params);
-
-        $params = array(
-            'contact_id' => (string) $result->reply->contact_ids->registrant,
-
-            'fn' => $c->getFirstName(),
-            'ln' => $c->getLastName(),
-            'ad' => $c->getAddress1(),
-            'ad2' => $c->getAddress2(),
-            'cy' => $c->getCity(),
-            'st' => $c->getState(),
-            'zp' => $c->getZip(),
-            'ct' => $c->getCountry(),
-            'em' => $c->getEmail(),
-            'ph' => $c->getTel(),
+        $contactId = trim(
+            (string) (
+                $domainInfo->reply->contact_ids->registrant ?? ''
+            )
         );
+
+        if ($contactId === '') {
+            throw new Registrar_Exception(
+                'NameSilo did not return a registrant contact ID for :domain.',
+                [
+                    ':domain' => $domain->getName(),
+                ]
+            );
+        }
+
+        $contact = $domain->getContactRegistrar();
+
+        $params = [
+            'contact_id' => $contactId,
+            'fn' => $contact->getFirstName(),
+            'ln' => $contact->getLastName(),
+            'ad' => $contact->getAddress1(),
+            'cy' => $contact->getCity(),
+            'st' => $contact->getState(),
+            'zp' => $contact->getZip(),
+            'ct' => $contact->getCountry(),
+            'em' => $contact->getEmail(),
+            'ph' => $this->formatPhone($contact->getTel()),
+        ];
+
+        if ($contact->getAddress2()) {
+            $params['ad2'] = $contact->getAddress2();
+        }
+
+        if ($contact->getCompany()) {
+            $params['cp'] = $contact->getCompany();
+        }
+
+        if ($contact->getFax()) {
+            $params['fx'] = $this->formatPhone($contact->getFax());
+        }
 
         $this->_request('contactUpdate', $params);
 
@@ -138,356 +276,676 @@ class Registrar_Adapter_Namesilo extends Registrar_AdapterAbstract
     }
 
     /**
-     * @param Registrar_Domain $domain
-     * @return bool
-     * @throws Registrar_Exception
-     * @see https://www.namesilo.com/api_reference.php#transferDomain
+     * Transfer a domain into NameSilo.
      */
-    public function transferDomain(Registrar_Domain $domain)
+    public function transferDomain(Registrar_Domain $domain): bool
     {
-        $params = array(
+        $contact = $domain->getContactRegistrar();
+
+        $params = [
             'domain' => $domain->getName(),
             'auth' => $domain->getEpp(),
-        );
+            'private' => $this->config['default-private'] ? '1' : '0',
+            'auto_renew' => $this->config['default-auto-renew'] ? '1' : '0',
 
-        if ($domain->getName() == '.us'){
+            'fn' => $contact->getFirstName(),
+            'ln' => $contact->getLastName(),
+            'ad' => $contact->getAddress1(),
+            'cy' => $contact->getCity(),
+            'st' => $contact->getState(),
+            'zp' => $contact->getZip(),
+            'ct' => $contact->getCountry(),
+            'em' => $contact->getEmail(),
+            'ph' => $this->formatPhone($contact->getTel()),
+        ];
+
+        if ($contact->getAddress2()) {
+            $params['ad2'] = $contact->getAddress2();
+        }
+
+        if ($contact->getCompany()) {
+            $params['cp'] = $contact->getCompany();
+        }
+
+        if ($contact->getFax()) {
+            $params['fx'] = $this->formatPhone($contact->getFax());
+        }
+
+        $this->addNameservers($params, $domain);
+
+        if (!empty($this->config['payment-id'])) {
+            $params['payment_id'] = $this->config['payment-id'];
+        }
+
+        /*
+         * .US requires these fields.
+         *
+         * FOSSBilling's domain model does not currently expose
+         * dedicated NameSilo .US nexus/application-purpose fields,
+         * so these defaults mirror the legacy NameSilo adapter.
+         */
+        if ($this->getTld($domain) === '.us') {
             $params['usnc'] = 'C12';
             $params['usap'] = 'P3';
         }
 
-        $c = $domain->getContactRegistrar();
-        $params['fn'] = $c->getFirstName();
-        $params['ln'] = $c->getLastName();
-        $params['ad'] = $c->getAddress1();
-        $params['ad2'] = $c->getAddress2();
-        $params['cy'] = $c->getCity();
-        $params['st'] = $c->getState();
-        $params['zp'] = $c->getZip();
-        $params['ct'] = $c->getCountry();
-        $params['em'] = $c->getEmail();
-        $params['ph'] = $c->getTel();
-
         $this->_request('transferDomain', $params);
+
         return true;
     }
 
     /**
-     * @param Registrar_Domain $domain
-     * @return Registrar_Domain
-     * @throws Registrar_Exception
-     * @see https://www.namesilo.com/api_reference.php#getDomainInfo
-     * @see https://www.namesilo.com/api_reference.php#contactList
+     * Retrieve registered domain details.
      */
     public function getDomainDetails(Registrar_Domain $domain)
     {
-        $params = array(
-            'domain' => $domain->getName(),
+        $xml = $this->_request(
+            'getDomainInfo',
+            [
+                'domain' => $domain->getName(),
+            ]
         );
 
-        $result = $this->_request('getDomainInfo', $params);
-        $result = $result->reply;
+        $reply = $xml->reply;
 
-        $params = array(
-            'contact_id' => (string) $result->contact_ids->registrant,
-        );
+        /*
+         * Registration date.
+         */
+        if (isset($reply->created)) {
+            $created = strtotime((string) $reply->created);
 
-        $contact = $this->_request('contactList', $params);
-        $contact = $contact->reply->contact;
-
-        $c = new Registrar_Domain_Contact();
-        $c->setFirstName((string) $contact->first_name)
-            ->setLastName((string) $contact->last_name)
-            ->setEmail((string) $contact->email)
-            ->setCompany((string) $contact->company)
-            ->setTel((string) $contact->phone)
-            ->setAddress1((string) $contact->address)
-            ->setAddress2((string) $contact->address2)
-            ->setCity((string) $contact->city)
-            ->setCountry((string) $contact->country)
-            ->setZip((string) $contact->zip);
-        // Add nameservers
-        $i = 1;
-        foreach ($result->nameservers->nameserver as $ns)
-        {
-            if ($i == 1){
-                $domain->setNs1((string) $ns);
+            if ($created !== false) {
+                $domain->setRegistrationTime($created);
             }
-            if ($i == 2){
-                $domain->setNs2((string) $ns);
-            }
-            if ($i == 3){
-                $domain->setNs3((string) $ns);
-            }
-            if ($i == 4){
-                $domain->setNs4((string) $ns);
-            }
-            $i++;
         }
-        $privacy = false;
-        if ((string) $result->private == 'Yes')
-            $privacy = true;
 
-        $domain->setExpirationTime(strtotime($result->expires));
-        $domain->setRegistrationTime(strtotime($result->created));
-        $domain->setPrivacyEnabled($privacy);
-        //$domain->setEpp();
-        $domain->setContactRegistrar($c);
+        /*
+         * Expiration date.
+         */
+        if (isset($reply->expires)) {
+            $expires = strtotime((string) $reply->expires);
+
+            if ($expires !== false) {
+                $domain->setExpirationTime($expires);
+            }
+        }
+
+        /*
+         * WHOIS privacy.
+         */
+        $domain->setPrivacyEnabled(
+            strcasecmp(
+                trim((string) ($reply->private ?? 'No')),
+                'Yes'
+            ) === 0
+        );
+
+        /*
+         * Nameservers.
+         */
+        if (isset($reply->nameservers->nameserver)) {
+            $position = 1;
+
+            foreach ($reply->nameservers->nameserver as $nameserver) {
+                $nameserver = trim((string) $nameserver);
+
+                if ($nameserver === '') {
+                    continue;
+                }
+
+                switch ($position) {
+                    case 1:
+                        $domain->setNs1($nameserver);
+                        break;
+
+                    case 2:
+                        $domain->setNs2($nameserver);
+                        break;
+
+                    case 3:
+                        $domain->setNs3($nameserver);
+                        break;
+
+                    case 4:
+                        $domain->setNs4($nameserver);
+                        break;
+                }
+
+                $position++;
+
+                if ($position > 4) {
+                    break;
+                }
+            }
+        }
+
+        /*
+         * Retrieve registrant contact.
+         */
+        $contactId = trim(
+            (string) (
+                $reply->contact_ids->registrant ?? ''
+            )
+        );
+
+        if ($contactId !== '') {
+            $contactXml = $this->_request(
+                'contactList',
+                [
+                    'contact_id' => $contactId,
+                ]
+            );
+
+            if (isset($contactXml->reply->contact)) {
+                $contactData = $contactXml->reply->contact;
+
+                $contact = new Registrar_Domain_Contact();
+
+                $contact
+                    ->setFirstName((string) ($contactData->first_name ?? ''))
+                    ->setLastName((string) ($contactData->last_name ?? ''))
+                    ->setEmail((string) ($contactData->email ?? ''))
+                    ->setCompany((string) ($contactData->company ?? ''))
+                    ->setTel((string) ($contactData->phone ?? ''))
+                    ->setAddress1((string) ($contactData->address ?? ''))
+                    ->setAddress2((string) ($contactData->address2 ?? ''))
+                    ->setCity((string) ($contactData->city ?? ''))
+                    ->setCountry((string) ($contactData->country ?? ''))
+                    ->setZip((string) ($contactData->zip ?? ''));
+
+                if (isset($contactData->state)) {
+                    $contact->setState(
+                        (string) $contactData->state
+                    );
+                }
+
+                if (isset($contactData->fax)) {
+                    $contact->setFax(
+                        (string) $contactData->fax
+                    );
+                }
+
+                $contact->setId($contactId);
+
+                $domain->setContactRegistrar($contact);
+            }
+        }
 
         return $domain;
-
     }
 
     /**
-     * @param Registrar_Domain $domain
-     * @throws Registrar_Exception
+     * NameSilo does not expose a delete-domain operation
+     * suitable for FOSSBilling's registrar deletion action.
      */
-    public function deleteDomain(Registrar_Domain $domain)
+    public function deleteDomain(Registrar_Domain $domain): bool
     {
-        throw new Registrar_Exception('Registrar does not support domain removal.');
-    }
-    /**
-     * @param Registrar_Domain $domain
-     * @return bool
-     * @throws Registrar_Exception
-     * @see https://www.namesilo.com/api_reference.php#registerDomain
-     */
-    public function registerDomain(Registrar_Domain $domain)
-    {
-        $c = $domain->getContactRegistrar();
-
-        $params = array(
-            'domain' => $domain->getName(),
-            'years' => $domain->getRegistrationPeriod(),          
-
-            'fn' => $c->getFirstName(),
-            'ln' => $c->getLastName(),
-            'ad' => $c->getAddress1(),
-            'ad2' => $c->getAddress2(),
-            'cy' => $c->getCity(),
-            'st' => $c->getState(),
-            'zp' => $c->getZip(),
-            'ct' => $c->getCountry(),
-            'em' => $c->getEmail(),
-            'ph' => $c->getTel(),
+        throw new Registrar_Exception(
+            'NameSilo does not support deleting a registered domain through the API.'
         );
+    }
 
-        if ($domain->getName() == '.us'){
+    /**
+     * Register a new domain.
+     */
+    public function registerDomain(Registrar_Domain $domain): bool
+    {
+        $contact = $domain->getContactRegistrar();
+
+        $years = (int) $domain->getRegistrationPeriod();
+
+        if ($years < 1) {
+            $years = 1;
+        }
+
+        if ($years > 10) {
+            $years = 10;
+        }
+
+        $params = [
+            'domain' => $domain->getName(),
+            'years' => $years,
+
+            /*
+             * NameSilo explicitly supports these two parameters.
+             *
+             * private=1  -> WHOIS privacy
+             * auto_renew=1 -> automatic renewal
+             */
+            'private' => $this->config['default-private'] ? '1' : '0',
+            'auto_renew' => $this->config['default-auto-renew'] ? '1' : '0',
+
+            'fn' => $contact->getFirstName(),
+            'ln' => $contact->getLastName(),
+            'ad' => $contact->getAddress1(),
+            'cy' => $contact->getCity(),
+            'st' => $contact->getState(),
+            'zp' => $contact->getZip(),
+            'ct' => $contact->getCountry(),
+            'em' => $contact->getEmail(),
+            'ph' => $this->formatPhone($contact->getTel()),
+        ];
+
+        /*
+         * Optional contact fields.
+         */
+        if ($contact->getAddress2()) {
+            $params['ad2'] = $contact->getAddress2();
+        }
+
+        if ($contact->getCompany()) {
+            $params['cp'] = $contact->getCompany();
+        }
+
+        if ($contact->getFax()) {
+            $params['fx'] = $this->formatPhone($contact->getFax());
+        }
+
+        /*
+         * Namesilo allows up to 13 nameservers.
+         *
+         * FOSSBilling's Registrar_Domain currently exposes the
+         * first four through the standard adapter interface.
+         */
+        $this->addNameservers($params, $domain);
+
+        /*
+         * Optional payment method.
+         */
+        if (!empty($this->config['payment-id'])) {
+            $params['payment_id'] = $this->config['payment-id'];
+        }
+
+        /*
+         * .US registration requirements.
+         *
+         * These are the same defaults used by the older NameSilo
+         * FOSSBilling adapter.
+         */
+        if ($this->getTld($domain) === '.us') {
             $params['usnc'] = 'C12';
             $params['usap'] = 'P3';
         }
 
-        $params['ns1'] = $domain->getNs1();
-        $params['ns2'] = $domain->getNs2();
-        if($domain->getNs3())  {
-            $params['ns3'] = $domain->getNs3();
-        }
-        if($domain->getNs4())  {
-            $params['ns4'] = $domain->getNs4();
-        }
-        $result = $this->_request('registerDomain', $params);
+        $this->_request('registerDomain', $params);
 
         return true;
     }
 
     /**
-     * @param Registrar_Domain $domain
-     * @return bool
-     * @throws Registrar_Exception
-     * @see https://www.namesilo.com/api_reference.php#renewDomain
+     * Renew domain.
      */
-    public function renewDomain(Registrar_Domain $domain)
+    public function renewDomain(Registrar_Domain $domain): bool
     {
-        $params = array(
+        $years = (int) $domain->getRegistrationPeriod();
+
+        if ($years < 1) {
+            $years = 1;
+        }
+
+        $params = [
             'domain' => $domain->getName(),
-            'years' => $domain->getRegistrationPeriod(),
-        );
+            'years' => $years,
+        ];
+
+        if (!empty($this->config['payment-id'])) {
+            $params['payment_id'] = $this->config['payment-id'];
+        }
 
         $this->_request('renewDomain', $params);
+
         return true;
     }
 
     /**
-     * @param Registrar_Domain $domain
-     * @return bool
-     * @throws Registrar_Exception
-     * @see https://www.namesilo.com/api_reference.php#removePrivacy
-     * @see https://www.namesilo.com/api_reference.php#addPrivacy
+     * Enable WHOIS privacy.
      */
-    public function togglePrivacyProtection(Registrar_Domain $domain)
+    public function enablePrivacyProtection(Registrar_Domain $domain): bool
     {
-        $params = array(
-            'domain' => $domain->getName(),
-        );
-
-        $result = $this->_request('getDomainInfo', $params);
-
-        $cmd = 'removePrivacy';
-        if ((string) $result->reply->private == 'No')
-            $cmd = 'addPrivacy';
-
-        $this->_request($cmd, $params);
-        return true;
-    }
-
-    /**
-     * @param Registrar_Domain $domain
-     * @return bool
-     * @throws Registrar_Exception
-     * @see https://www.namesilo.com/api_reference.php#checkTransferAvailability
-     */
-    public function isDomaincanBeTransferred(Registrar_Domain $domain)
-    {
-        $params = array(
-            'domains' => $domain->getName(),
-        );
-
-        $result = $this->_request('checkTransferAvailability', $params);
-
-        return (isset($result->reply->available)
-            && ($result->reply->available->domain == $domain->getName()));
-    }
-
-    /**
-     * @param Registrar_Domain $domain
-     * @return bool
-     * @throws Registrar_Exception
-     * @see https://www.namesilo.com/api_reference.php#domainLock
-     */
-    public function lock(Registrar_Domain $domain)
-    {
-        $params = array(
-            'domain' => $domain->getName(),
-        );
-
-        $result = $this->_request('domainLock', $params);
-        return true;
-    }
-
-    /**
-     * @param Registrar_Domain $domain
-     * @return bool
-     * @throws Registrar_Exception
-     * @see https://www.namesilo.com/api_reference.php#domainUnlock
-     */
-    public function unlock(Registrar_Domain $domain)
-    {
-        $params = array(
-            'domain' => $domain->getName(),
-        );
-
-        $result = $this->_request('domainUnlock', $params);
-        return true;
-    }
-
-    /**
-     * @param Registrar_Domain $domain
-     * @return bool
-     * @throws Registrar_Exception
-     * @see https://www.namesilo.com/api_reference.php#addPrivacy
-     */
-    public function enablePrivacyProtection(Registrar_Domain $domain)
-    {
-        $params = array(
-            'domain' => $domain->getName(),
-        );
-
-        $result = $this->_request('addPrivacy', $params);
-        return true;
-    }
-
-    /**
-     * @param Registrar_Domain $domain
-     * @return bool
-     * @throws Registrar_Exception
-     * @see https://www.namesilo.com/api_reference.php#removePrivacy
-     */
-    public function disablePrivacyProtection(Registrar_Domain $domain)
-    {
-        $params = array(
-            'domain' => $domain->getName(),
-        );
-
-        $result = $this->_request('removePrivacy', $params);
-        return true;
-    }
-
-    /**
-     * @param Registrar_Domain $domain
-     * @return bool
-     * @throws Registrar_Exception
-     * @see https://www.namesilo.com/api_reference.php#retrieveAuthCode
-     */
-    public function getEpp(Registrar_Domain $domain)
-    {
-        $params = array(
-            'domain' => $domain->getName(),
-        );
-
-        $result = $this->_request('retrieveAuthCode', $params);
-        return 'EPP transfer code for the domain emailed to the administrative contact';
-    }
-    /**
-     * Runs an api command and returns parsed data.
-     * @param string $cmd
-     * @param array $params
-     * @return array
-     */
-    private function _request($cmd, $params)
-    {
-        $params['version'] = 1;
-        $params['type'] = 'xml';
-        $params['key'] = $this->config['apikey'];
-        $params['payment_id'] = $this->config['Payment_ID'];
-
-        $query = http_build_query($params);
-
-        $curl_opts = array(
-            CURLOPT_URL => $this->_getApiUrl() . $cmd . '?' . $query,
-            CURLOPT_SSL_VERIFYHOST => 0,
-            CURLOPT_SSL_VERIFYPEER => 0,
-            CURLOPT_RETURNTRANSFER => 1,
-            CURLOPT_FOLLOWLOCATION => 1,
-        );
-
-        $ch = curl_init();
-        curl_setopt_array($ch, $curl_opts);
-
-        $result = curl_exec($ch);
-
-        if ($result === false) {
-            $e = new Registrar_Exception(sprintf('CurlException: "%s"', curl_error($ch)));
-            $this->getLog()->err($e);
-            curl_close($ch);
-            throw $e;
+        if ($this->privacyUnsupported($domain)) {
+            throw new Registrar_Exception(
+                'NameSilo WHOIS privacy is not available for :domain.',
+                [
+                    ':domain' => $domain->getName(),
+                ]
+            );
         }
-        curl_close($ch);
 
-        $this->getLog()->debug($this->_getApiUrl() . $cmd . '?' . $query);
-        $this->getLog()->debug(print_r($result, true));
+        $this->_request(
+            'addPrivacy',
+            [
+                'domain' => $domain->getName(),
+            ]
+        );
+
+        return true;
+    }
+
+    /**
+     * Disable WHOIS privacy.
+     */
+    public function disablePrivacyProtection(Registrar_Domain $domain): bool
+    {
+        $this->_request(
+            'removePrivacy',
+            [
+                'domain' => $domain->getName(),
+            ]
+        );
+
+        return true;
+    }
+
+    /**
+     * Request EPP/auth code.
+     *
+     * IMPORTANT:
+     * NameSilo's retrieveAuthCode operation sends the actual
+     * authorization code to the administrative contact email.
+     * The API response does not contain the actual EPP code.
+     */
+    public function getEpp(Registrar_Domain $domain): string
+    {
+        $this->_request(
+            'retrieveAuthCode',
+            [
+                'domain' => $domain->getName(),
+            ]
+        );
+
+        /*
+         * Registrar_AdapterAbstract requires a string.
+         * NameSilo does not return the actual code through this
+         * operation, so returning the email notification text
+         * is more accurate than pretending it is the EPP code.
+         */
+        return 'NameSilo has emailed the EPP transfer code to the administrative contact.';
+    }
+
+    /**
+     * Lock domain.
+     */
+    public function lock(Registrar_Domain $domain): bool
+    {
+        $this->_request(
+            'domainLock',
+            [
+                'domain' => $domain->getName(),
+            ]
+        );
+
+        return true;
+    }
+
+    /**
+     * Unlock domain.
+     */
+    public function unlock(Registrar_Domain $domain): bool
+    {
+        $this->_request(
+            'domainUnlock',
+            [
+                'domain' => $domain->getName(),
+            ]
+        );
+
+        return true;
+    }
+
+    /**
+     * Test environment helper.
+     */
+    public function isTestEnv(): bool
+    {
+        return $this->_testMode;
+    }
+
+    /**
+     * Execute a NameSilo API request and parse the XML response.
+     *
+     * NameSilo requires GET requests.
+     */
+    private function _request(string $operation, array $params = []): \SimpleXMLElement
+    {
+        $query = [
+            'version' => 1,
+            'type' => 'xml',
+            'key' => $this->config['api-key'],
+        ];
+
+        foreach ($params as $key => $value) {
+            if ($value === null) {
+                continue;
+            }
+
+            $query[$key] = $value;
+        }
+
+        $url = $this->getApiUrl() . $operation;
+
+        /*
+         * Do not put the API key into logs.
+         */
+        $logQuery = $query;
+        $logQuery['key'] = 'REDACTED';
+
+        $this->getLog()->debug(
+            'NameSilo API request: ' .
+            $url .
+            '?' .
+            http_build_query($logQuery)
+        );
+
         try {
-            $xml = new SimpleXMLElement($result);
-        } catch (Exception $e) {
-            throw new Registrar_Exception($e->getMessage());
+            $response = $this->getHttpClient()->request(
+                'GET',
+                $url,
+                [
+                    'query' => $query,
+                    'timeout' => 60,
+                ]
+            );
+
+            $body = $response->getContent(false);
+        } catch (\Throwable $e) {
+            $this->getLog()->error(
+                'NameSilo API connection error: ' .
+                $e->getMessage()
+            );
+
+            throw new Registrar_Exception(
+                'Unable to connect to the NameSilo API. Check the FOSSBilling log for details.'
+            );
         }
 
-        if ($xml->reply->code != 300)
-            throw new Registrar_Exception($xml->reply->detail);
+        if (trim($body) === '') {
+            throw new Registrar_Exception(
+                'NameSilo returned an empty API response.'
+            );
+        }
+
+        /*
+         * Log the response, but make sure the API key can never
+         * appear here.
+         */
+        $this->getLog()->debug(
+            'NameSilo API response: ' . $body
+        );
+
+        libxml_use_internal_errors(true);
+
+        try {
+            $xml = new \SimpleXMLElement(
+                $body,
+                LIBXML_NONET | LIBXML_NOCDATA
+            );
+        } catch (\Throwable $e) {
+            $errors = libxml_get_errors();
+            libxml_clear_errors();
+
+            $errorMessage = 'Unable to parse NameSilo XML response.';
+
+            if (!empty($errors)) {
+                $errorMessage .= ' ' . trim(
+                    (string) $errors[0]->message
+                );
+            }
+
+            throw new Registrar_Exception($errorMessage);
+        }
+
+        libxml_clear_errors();
+
+        if (!isset($xml->reply)) {
+            throw new Registrar_Exception(
+                'NameSilo returned an invalid API response: missing reply element.'
+            );
+        }
+
+        $code = isset($xml->reply->code)
+            ? (int) $xml->reply->code
+            : 0;
+
+        if ($code !== 300) {
+            $detail = trim(
+                (string) (
+                    $xml->reply->detail
+                    ?? $xml->reply->message
+                    ?? 'Unknown NameSilo API error.'
+                )
+            );
+
+            if ($detail === '') {
+                $detail = 'Unknown NameSilo API error.';
+            }
+
+            throw new Registrar_Exception(
+                'NameSilo API error (:code): :detail',
+                [
+                    ':code' => (string) $code,
+                    ':detail' => $detail,
+                ]
+            );
+        }
 
         return $xml;
     }
 
-    public function isTestEnv()
-    {
-        return $this->_testMode;
-    }
     /**
-     * Api URL.
-     * @return string
+     * Get NameSilo API endpoint.
      */
-    private function _getApiUrl()
+    private function getApiUrl(): string
     {
-        if ($this->isTestEnv())
-            return 'http://sandbox.namesilo.com/api/';
+        if ($this->_testMode) {
+            return 'https://sandbox.namesilo.com/api/';
+        }
+
         return 'https://www.namesilo.com/api/';
+    }
+
+    /**
+     * Add FOSSBilling nameservers to a NameSilo request.
+     */
+    private function addNameservers(
+        array &$params,
+        Registrar_Domain $domain
+    ): void {
+        $nameservers = [
+            1 => $domain->getNs1(),
+            2 => $domain->getNs2(),
+            3 => $domain->getNs3(),
+            4 => $domain->getNs4(),
+        ];
+
+        foreach ($nameservers as $number => $nameserver) {
+            if (
+                $nameserver !== null &&
+                trim((string) $nameserver) !== ''
+            ) {
+                $params['ns' . $number] = trim(
+                    (string) $nameserver
+                );
+            }
+        }
+    }
+
+    /**
+     * Return the domain TLD in the format ".com".
+     */
+    private function getTld(Registrar_Domain $domain): string
+    {
+        $tld = strtolower(trim((string) $domain->getTld()));
+
+        if ($tld === '') {
+            return '';
+        }
+
+        if ($tld[0] !== '.') {
+            $tld = '.' . $tld;
+        }
+
+        return $tld;
+    }
+
+    /**
+     * Some TLDs do not support NameSilo WHOIS privacy.
+     */
+    private function privacyUnsupported(Registrar_Domain $domain): bool
+    {
+        return in_array(
+            $this->getTld($domain),
+            [
+                '.us',
+                '.ca',
+            ],
+            true
+        );
+    }
+
+    /**
+     * Format phone number for NameSilo.
+     *
+     * NameSilo's API expects the phone number without the
+     * country dialing prefix for US/CA and generally expects
+     * the contact's local phone representation.
+     *
+     * We preserve the digits while removing separators.
+     */
+    private function formatPhone(?string $phone): string
+    {
+        if ($phone === null) {
+            return '';
+        }
+
+        return preg_replace(
+            '/[^\d+]/',
+            '',
+            trim($phone)
+        ) ?? '';
+    }
+
+    /**
+     * Convert saved FOSSBilling configuration values to bool.
+     */
+    private function toBool(mixed $value): bool
+    {
+        if (is_bool($value)) {
+            return $value;
+        }
+
+        if (is_int($value)) {
+            return $value === 1;
+        }
+
+        return in_array(
+            strtolower(trim((string) $value)),
+            [
+                '1',
+                'true',
+                'yes',
+                'on',
+            ],
+            true
+        );
     }
 }

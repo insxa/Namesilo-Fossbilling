@@ -3,6 +3,9 @@
 declare(strict_types=1);
 
 /**
+ *Copyright 2026 FOSSBilling
+ * SPDX-License-Identifier: Apache-2.0.
+ *
  * NameSilo registrar adapter for FOSSBilling.
  *
  * Documentation: https://github.com/insxa/Namesilo-Fossbilling

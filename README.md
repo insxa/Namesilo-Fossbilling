@@ -1,4 +1,4 @@
 # Namesilo-Fossbilling
 This is Namesilo module for Fossbilling domain registrar <br>
 For setup upload Namesilo.php to your Fossbilling installation in folder library/Registrar/Adapter<br>
-After that go to your admin System -> Domain Registartion ( link admin/servicedomain ) New Domain Registrar tab and install Namesilo
+After that go to your admin System -> Domain Registration ( link admin/servicedomain ) New Domain Registrar tab and install Namesilo
